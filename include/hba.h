@@ -18,6 +18,6 @@
 
 struct HBA;
 
-struct HBA *hba_load_rules(const char *fn);
+struct HBA *hba_load_rules(const char *fn_hba, const char *fn_ident);
 void hba_free(struct HBA *hba);
 int hba_eval(struct HBA *hba, PgAddr *addr, bool is_tls, const char *dbname, const char *username);

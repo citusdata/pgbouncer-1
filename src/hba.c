@@ -51,10 +51,24 @@ struct HBARule {
 	uint8_t rule_mask[16];
 	struct HBAName db_name;
 	struct HBAName user_name;
+	char *map;
+};
+
+struct HBAIdent {
+	struct List node;
+	char *map_name;
+	struct List kv;
+};
+
+struct HBAIdentKv {
+	struct List node;
+	char *system_username;
+	char *database_username;
 };
 
 struct HBA {
 	struct List rules;
+	struct List idents;
 };
 
 /*
@@ -177,6 +191,7 @@ enum TokType {
 	TOK_STRING,
 	TOK_IDENT,
 	TOK_COMMA,
+	TOK_EQUAL,
 	TOK_FAIL,
 	TOK_EOL
 };
@@ -223,6 +238,9 @@ static enum TokType next_token(struct TokParser *p)
 	} else if (p->pos[0] == ',') {
 		p->cur_tok = TOK_COMMA;
 		p->pos++;
+	} else if (p->pos[0] == '=') {
+		p->cur_tok = TOK_EQUAL;
+		p->pos++;
 	} else if (p->pos[0] == '"') {
 		for (s = p->pos+1; s[0]; s++) {
 			if (s[0] == '"') {
@@ -245,7 +263,7 @@ static enum TokType next_token(struct TokParser *p)
 		p->cur_tok_str = p->buf;
 	} else {
 		for (s = p->pos + 1; *s; s++) {
-			if (*s == ',' || *s == '#' || *s == '"')
+			if (*s == ',' || *s == '#' || *s == '"' || *s == '=')
 				break;
 			if (isspace((unsigned char)*s))
 				break;
@@ -452,6 +470,7 @@ static void rule_free(struct HBARule *rule)
 {
 	strset_free(rule->db_name.name_set);
 	strset_free(rule->user_name.name_set);
+	free(rule->map);
 	free(rule);
 }
 
@@ -595,6 +614,26 @@ static bool parse_line(struct HBA *hba, struct TokParser *tp, int linenr, const 
 		goto failed;
 	}
 
+	if (rule->rule_method == AUTH_PEER || rule->rule_method == AUTH_CERT) {
+		if (eat_kw(tp, "map")) {
+			if (!eat(tp, TOK_EQUAL)) {
+				log_warning("hba line %d: expected =", linenr);
+				goto failed;
+			}
+			if (eat(tp, TOK_IDENT) || eat(tp, TOK_STRING)) {
+				rule->map = malloc(tp->buflen);
+				if (!rule->map) {
+					log_warning("hba: no mem for rule->map");
+					goto failed;
+				}
+				memcpy(rule->map, tp->buf, tp->buflen);
+			} else {
+				log_warning("hba line %d: expected value after =", linenr);
+				goto failed;
+			}
+		}
+	}
+
 	if (!eat(tp, TOK_EOL)) {
 		log_warning("hba line %d: unsupported parameters", linenr);
 		goto failed;
@@ -607,10 +646,95 @@ failed:
 	return false;
 }
 
-struct HBA *hba_load_rules(const char *fn)
+static bool parse_ident_line(struct List *idents, struct TokParser *tp, int linenr, const char *parent_filename)
+{
+	 enum TokType tptype;
+	 char *map, *system, *database;
+	 struct HBAIdent *ident, *el_ident;
+	 struct HBAIdentKv *identkv;
+	 struct List *el;
+
+	 tptype = next_token(tp); /* map-name */
+	 if (tptype == TOK_IDENT || TOK_STRING) {
+		 map = malloc(tp->buflen);
+		 if (!map) {
+			 log_warning("ident: no mem for map name");
+			 goto failed;
+		 }
+		 memcpy(map, tp->buf, tp->buflen);
+	 } else {
+		 goto failed;
+	 }
+
+	 tptype = next_token(tp); /* system-username */
+	 if (tptype == TOK_IDENT || TOK_STRING) {
+		 system = malloc(tp->buflen);
+		 if (!system) {
+			 log_warning("ident: no mem for system username");
+			 goto failed;
+		 }
+		 memcpy(system, tp->buf, tp->buflen);
+	 } else {
+		 goto failed;
+	 }
+
+	 tptype = next_token(tp); /* database-username */
+	 if (tptype == TOK_IDENT || TOK_STRING) {
+		 database = malloc(tp->buflen);
+		 if (!database) {
+			 log_warning("ident: no mem for database username");
+			 goto failed;
+		 }
+		 memcpy(database, tp->buf, tp->buflen);
+	 } else {
+		 goto failed;
+	 }
+
+	 tptype = next_token(tp);
+	 if (tptype != TOK_EOL) {
+		log_warning("ident line %d: line didn't end as expected", linenr);
+		goto failed;
+	 }
+
+	 ident = NULL;
+	 list_for_each(el, idents) {
+		el_ident = container_of(el, struct HBAIdent, node);
+		if (strcmp(el_ident->map_name, map) == 0) {
+			ident = el_ident;
+			break;
+		}
+	 }
+
+	 if (!ident) {
+		 ident = malloc(sizeof *ident);
+		 if (ident) {
+			 list_init(&ident->node);
+			 list_init(&ident->kv);
+			 ident->map_name = map;
+		 }
+	 }
+	 identkv = malloc(sizeof *identkv);
+
+	 if (!ident || !identkv) {
+		log_warning("ident: no mem");
+		 goto failed;
+	 }
+
+	 list_init(&identkv->node);
+	 identkv->system_username = system;
+	 identkv->database_username = database;
+
+	 list_append(&ident->kv, &identkv->node);
+
+failed:
+	 return false;
+}
+
+struct HBA *hba_load_rules(const char *fn_hba, const char *fn_ident)
 {
 	struct HBA *hba = NULL;
-	FILE *f = NULL;
+	FILE *f_hba = NULL;
+	FILE *f_ident = NULL;
 	char *ln = NULL;
 	size_t lnbuf = 0;
 	ssize_t len;
@@ -624,19 +748,41 @@ struct HBA *hba_load_rules(const char *fn)
 		goto out;
 
 	list_init(&hba->rules);
+	list_init(&hba->idents);
 
-	f = fopen(fn, "r");
-	if (!f) {
-		log_error("could not open hba config file %s: %s", fn, strerror(errno));
+	if (fn_ident) {
+		f_ident = fopen(fn_ident, "r");
+		if (!f_ident) {
+			log_error("could not open ident config file %s: %s", fn_ident, strerror(errno));
+			goto out;
+		}
+
+		for (linenr = 1; ; linenr++) {
+			len = getline(&ln, &lnbuf, f_ident);
+			if (len < 0)
+				break;
+			parse_from_string(&tp, ln);
+			if (!parse_ident_line(&hba->idents, &tp, linenr, fn_ident)) {
+				/* Tell the admin where to look for the problem. */
+				log_warning("could not parse ident config line %d", linenr);
+				/* Ignore line, but parse to the end. */
+				continue;
+			}
+		}
+	}
+
+	f_hba = fopen(fn_hba, "r");
+	if (!f_hba) {
+		log_error("could not open hba config file %s: %s", fn_hba, strerror(errno));
 		goto out;
 	}
 
 	for (linenr = 1; ; linenr++) {
-		len = getline(&ln, &lnbuf, f);
+		len = getline(&ln, &lnbuf, f_hba);
 		if (len < 0)
 			break;
 		parse_from_string(&tp, ln);
-		if (!parse_line(hba, &tp, linenr, fn)) {
+		if (!parse_line(hba, &tp, linenr, fn_hba)) {
 			/* Tell the admin where to look for the problem. */
 			log_warning("could not parse hba config line %d", linenr);
 			/* Ignore line, but parse to the end. */
@@ -646,21 +792,36 @@ struct HBA *hba_load_rules(const char *fn)
 out:
 	free_parser(&tp);
 	free(ln);
-	if (f)
-		fclose(f);
+	if (f_ident)
+		fclose(f_ident);
+	if (f_hba)
+		fclose(f_hba);
 	return hba;
 }
 
 void hba_free(struct HBA *hba)
 {
-	struct List *el, *tmp;
+	struct List *el, *tmp, *inner_el, *inner_tmp;
 	struct HBARule *rule;
+	struct HBAIdent *ident;
+	struct HBAIdentKv *identkv;
 	if (!hba)
 		return;
 	list_for_each_safe(el, &hba->rules, tmp) {
 		rule = container_of(el, struct HBARule, node);
 		list_del(&rule->node);
 		rule_free(rule);
+	}
+	list_for_each_safe(el, &hba->idents, tmp) {
+		ident = container_of(el, struct HBAIdent, node);
+		list_del(&ident->node);
+		free(ident->map_name);
+		list_for_each_safe(inner_el, &ident->kv, inner_tmp) {
+			identkv = container_of(inner_el, struct HBAIdentKv, node);
+			list_del(&identkv->node);
+			free(identkv->system_username);
+			free(identkv->database_username);
+		}
 	}
 	free(hba);
 }
