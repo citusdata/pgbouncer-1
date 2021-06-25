@@ -649,9 +649,12 @@ failed:
 static bool parse_ident_line(struct List *idents, struct TokParser *tp, int linenr, const char *parent_filename)
 {
 	 enum TokType tptype;
-	 char *map, *system, *database;
-	 struct HBAIdent *ident, *el_ident;
-	 struct HBAIdentKv *identkv;
+	 char *map = NULL;
+	 char *system = NULL;
+	 char *database = NULL;
+	 struct HBAIdent *ident = NULL;
+	 struct HBAIdent *el_ident = NULL;
+	 struct HBAIdentKv *identkv = NULL;
 	 struct List *el;
 
 	 tptype = next_token(tp); /* map-name */
@@ -701,7 +704,6 @@ static bool parse_ident_line(struct List *idents, struct TokParser *tp, int line
 		goto failed;
 	 }
 
-	 ident = NULL;
 	 list_for_each(el, idents) {
 		el_ident = container_of(el, struct HBAIdent, node);
 		if (strcmp(el_ident->map_name, map) == 0) {
@@ -731,7 +733,16 @@ static bool parse_ident_line(struct List *idents, struct TokParser *tp, int line
 
 	 list_append(&ident->kv, &identkv->node);
 
+	 return true;
 failed:
+	 free(map);
+	 free(system);
+	 free(database);
+	 free(identkv);
+	 /* if ident == el_ident, ident pre-existed */
+	 if (ident != el_ident)
+		 free(ident);
+
 	 return false;
 }
 
