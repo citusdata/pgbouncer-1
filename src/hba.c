@@ -673,6 +673,11 @@ static bool parse_ident_line(struct List *idents, struct TokParser *tp, int line
 			 log_warning("ident: no mem for system username");
 			 goto failed;
 		 }
+		 if (system[0] == '/') {
+			 /* TODO: support regex */
+			 log_warning("ident line %d: regex system usernames not supported", linenr);
+			 goto failed;
+		 }
 		 memcpy(system, tp->buf, tp->buflen);
 	 } else {
 		 goto failed;
