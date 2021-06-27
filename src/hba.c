@@ -768,7 +768,7 @@ struct HBA *hba_load_rules(const char *fn_hba, const char *fn_ident)
 	list_init(&hba->rules);
 	list_init(&hba->idents);
 
-	if (fn_ident) {
+	if (fn_ident && fn_ident[0]) {
 		f_ident = fopen(fn_ident, "r");
 		if (!f_ident) {
 			log_error("could not open ident config file %s: %s", fn_ident, strerror(errno));
