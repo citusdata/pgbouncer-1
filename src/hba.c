@@ -660,6 +660,10 @@ static bool parse_ident_line(struct List *idents, struct TokParser *tp, int line
 	 struct List *el;
 
 	 tptype = next_token(tp); /* map-name */
+	 if (tptype == TOK_EOL) {
+		 return true;
+	 }
+
 	 if (tptype == TOK_IDENT || TOK_STRING) {
 		 map = malloc(tp->buflen);
 		 if (!map) {
