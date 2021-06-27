@@ -51,19 +51,19 @@ struct HBARule {
 	uint8_t rule_mask[16];
 	struct HBAName db_name;
 	struct HBAName user_name;
-	char *map;
-};
-
-struct HBAIdent {
-	struct List node;
-	char *map_name;
-	struct List kv;
+	struct HBAIdentKv *map;
 };
 
 struct HBAIdentKv {
 	struct List node;
 	char *system_username;
 	char *database_username;
+};
+
+struct HBAIdent {
+	struct List node;
+	char *map_name;
+	struct HBAIdentKv kv;
 };
 
 struct HBA {
@@ -470,7 +470,6 @@ static void rule_free(struct HBARule *rule)
 {
 	strset_free(rule->db_name.name_set);
 	strset_free(rule->user_name.name_set);
-	free(rule->map);
 	free(rule);
 }
 
@@ -524,6 +523,8 @@ static bool parse_line(struct HBA *hba, struct TokParser *tp, int linenr, const 
 	enum RuleType rtype;
 	char *nmask = NULL;
 	struct HBARule *rule = NULL;
+	struct HBAIdent *ident;
+	struct List *el;
 
 	if (eat_kw(tp, "local")) {
 		rtype = RULE_LOCAL;
@@ -621,12 +622,13 @@ static bool parse_line(struct HBA *hba, struct TokParser *tp, int linenr, const 
 				goto failed;
 			}
 			if (eat(tp, TOK_IDENT) || eat(tp, TOK_STRING)) {
-				rule->map = malloc(tp->buflen);
-				if (!rule->map) {
-					log_warning("hba: no mem for rule->map");
-					goto failed;
+				list_for_each(el, &hba->idents) {
+					ident = container_of(el, struct HBAIdent, node);
+					if (strcmp(tp->buf, ident->map_name) == 0) {
+						rule->map = &ident->kv;
+						break;
+					}
 				}
-				memcpy(rule->map, tp->buf, tp->buflen);
 			} else {
 				log_warning("hba line %d: expected value after =", linenr);
 				goto failed;
@@ -716,7 +718,7 @@ static bool parse_ident_line(struct List *idents, struct TokParser *tp, int line
 		 ident = malloc(sizeof *ident);
 		 if (ident) {
 			 list_init(&ident->node);
-			 list_init(&ident->kv);
+			 list_init(&ident->kv.node);
 			 ident->map_name = map;
 		 }
 	 }
@@ -731,7 +733,7 @@ static bool parse_ident_line(struct List *idents, struct TokParser *tp, int line
 	 identkv->system_username = system;
 	 identkv->database_username = database;
 
-	 list_append(&ident->kv, &identkv->node);
+	 list_append(&ident->kv.node, &identkv->node);
 
 	 return true;
 failed:
@@ -832,7 +834,7 @@ void hba_free(struct HBA *hba)
 		ident = container_of(el, struct HBAIdent, node);
 		list_del(&ident->node);
 		free(ident->map_name);
-		list_for_each_safe(inner_el, &ident->kv, inner_tmp) {
+		list_for_each_safe(inner_el, &ident->kv.node, inner_tmp) {
 			identkv = container_of(inner_el, struct HBAIdentKv, node);
 			list_del(&identkv->node);
 			free(identkv->system_username);
@@ -876,7 +878,7 @@ static bool match_inet6(const struct HBARule *rule, PgAddr *addr)
 		(src[2] & mask[2]) == base[2] && (src[3] & mask[3]) == base[3];
 }
 
-int hba_eval(struct HBA *hba, PgAddr *addr, bool is_tls, const char *dbname, const char *username)
+struct HBARule *hba_eval(struct HBA *hba, PgAddr *addr, bool is_tls, const char *dbname, const char *username)
 {
 	struct List *el;
 	struct HBARule *rule;
@@ -884,7 +886,7 @@ int hba_eval(struct HBA *hba, PgAddr *addr, bool is_tls, const char *dbname, con
 	unsigned int unamelen = strlen(username);
 
 	if (!hba)
-		return AUTH_REJECT;
+		return NULL;
 
 	list_for_each(el, &hba->rules) {
 		rule = container_of(el, struct HBARule, node);
@@ -916,7 +918,32 @@ int hba_eval(struct HBA *hba, PgAddr *addr, bool is_tls, const char *dbname, con
 			continue;
 
 		/* rule matches */
-		return rule->rule_method;
+		return rule;
 	}
-	return AUTH_REJECT;
+	return NULL;
+}
+
+int hba_rule_method(struct HBARule *rule) {
+	return rule ? rule->rule_method : AUTH_REJECT;
+}
+
+bool hba_rule_has_map(struct HBARule *rule) {
+	return rule && rule->map;
+}
+
+const char *hba_rule_map_name(struct HBARule *rule, const char *name) {
+	struct HBAIdentKv *kv;
+	struct List *el;
+
+	if (!rule || !rule->map)
+		return name;
+
+	list_for_each(el, &rule->map->node) {
+		kv = container_of(el, struct HBAIdentKv, node);
+		if (strcmp(kv->system_username, name)) {
+			return kv->database_username;
+		}
+	}
+
+	return NULL;
 }

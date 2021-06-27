@@ -25,6 +25,7 @@
 #include "scram.h"
 
 #include <usual/pgutil.h>
+#include <usual/tls/tls_internal.h>
 
 static const char *hdr2hex(const struct MBuf *data, char *buf, unsigned buflen)
 {
@@ -148,7 +149,7 @@ static void start_auth_query(PgSocket *client, const char *username)
 		disconnect_server(client->link, false, "unable to send login query");
 }
 
-static bool login_via_cert(PgSocket *client)
+static bool login_via_cert(PgSocket *client, struct HBARule *hba_rule)
 {
 	struct tls *tls = client->sbuf.tls;
 
@@ -164,9 +165,46 @@ static bool login_via_cert(PgSocket *client)
 		goto fail;
 
 	log_debug("TLS cert login: %s", tls_peer_cert_subject(client->sbuf.tls));
-	if (!tls_peer_cert_contains_name(client->sbuf.tls, client->login_user->name)) {
-		slog_error(client, "TLS certificate name mismatch");
-		goto fail;
+	if (hba_rule_has_map(hba_rule)) {
+		X509 *cert = client->sbuf.tls->ssl_peer_cert;
+		X509_NAME *subject_name;
+		char *common_name = NULL;
+		int common_name_len;
+		const char *mapped_name;
+
+		subject_name = X509_get_subject_name(cert);
+		if (subject_name == NULL)
+			goto fail;
+
+		common_name_len = X509_NAME_get_text_by_NID(subject_name,
+			NID_commonName, NULL, 0);
+		if (common_name_len < 0)
+			goto fail;
+
+		common_name = calloc(common_name_len + 1, 1);
+		if (common_name == NULL)
+			goto fail;
+
+		X509_NAME_get_text_by_NID(subject_name, NID_commonName, common_name,
+			common_name_len + 1);
+
+		/* NUL bytes in CN? */
+		if (common_name_len != (int)strlen(common_name)) {
+			slog_error(client, "NUL byte in Common Name field, "
+				"probably a malicious certificate");
+			goto fail;
+		}
+
+		mapped_name = hba_rule_map_name(hba_rule, common_name);
+		if (mapped_name && strcmp(mapped_name, client->login_user->name) != 0) {
+			slog_error(client, "TLS certificate mapped name mismatch");
+			goto fail;
+		}
+	} else {
+		if (!tls_peer_cert_contains_name(client->sbuf.tls, client->login_user->name)) {
+			slog_error(client, "TLS certificate name mismatch");
+			goto fail;
+		}
 	}
 
 	/* login successful */
@@ -176,13 +214,21 @@ fail:
 	return false;
 }
 
-static bool login_as_unix_peer(PgSocket *client)
+static bool login_as_unix_peer(PgSocket *client, struct HBARule *hba_rule)
 {
+	const char *peer_name = NULL;
+
 	if (!pga_is_unix(&client->remote_addr))
 		goto fail;
 	if (client->login_user->mock_auth)
 		goto fail;
-	if (!check_unix_peer_name(sbuf_socket(&client->sbuf), client->login_user->name))
+
+	peer_name = unix_peer_name(sbuf_socket(&client->sbuf));
+	if (hba_rule_has_map(hba_rule)) {
+		peer_name = hba_rule_map_name(hba_rule, peer_name);
+	}
+
+	if (peer_name && strcmp(peer_name, client->login_user->name) != 0)
 		goto fail;
 	return finish_client_login(client);
 fail:
@@ -193,6 +239,7 @@ fail:
 static bool finish_set_pool(PgSocket *client, bool takeover)
 {
 	bool ok = false;
+	struct HBARule *hba_rule = NULL;
 	int auth;
 
 	if (!client->login_user->mock_auth) {
@@ -238,8 +285,9 @@ static bool finish_set_pool(PgSocket *client, bool takeover)
 
 	auth = cf_auth_type;
 	if (auth == AUTH_HBA) {
-		auth = hba_eval(parsed_hba, &client->remote_addr, !!client->sbuf.tls,
+		hba_rule = hba_eval(parsed_hba, &client->remote_addr, !!client->sbuf.tls,
 				client->db->name, client->login_user->name);
+		auth = hba_rule_method(hba_rule);
 	}
 
 	if (auth == AUTH_MD5)
@@ -268,10 +316,10 @@ static bool finish_set_pool(PgSocket *client, bool takeover)
 		ok = send_client_authreq(client);
 		break;
 	case AUTH_CERT:
-		ok = login_via_cert(client);
+		ok = login_via_cert(client, hba_rule);
 		break;
 	case AUTH_PEER:
-		ok = login_as_unix_peer(client);
+		ok = login_as_unix_peer(client, hba_rule);
 		break;
 	default:
 		disconnect_client(client, true, "login rejected");

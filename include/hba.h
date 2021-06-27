@@ -17,7 +17,11 @@
  */
 
 struct HBA;
+struct HBARule;
 
 struct HBA *hba_load_rules(const char *fn_hba, const char *fn_ident);
 void hba_free(struct HBA *hba);
-int hba_eval(struct HBA *hba, PgAddr *addr, bool is_tls, const char *dbname, const char *username);
+struct HBARule *hba_eval(struct HBA *hba, PgAddr *addr, bool is_tls, const char *dbname, const char *username);
+int hba_rule_method(struct HBARule *rule);
+bool hba_rule_has_map(struct HBARule *rule);
+const char *hba_rule_map_name(struct HBARule *rule, const char *name);
